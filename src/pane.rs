@@ -33,9 +33,9 @@ mod terminal;
 mod xtgettcap;
 
 use self::agent_detection::{
-    decide_detection_screen_read, decide_screen_detection_publish,
-    detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
+    decide_detection_screen_read, decide_screen_detection_publish, mark_detection_content_changed,
+    observe_detection_content_change, screen_detection_update_for_publish_with_osc,
+    BackgroundActivityTracker, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
@@ -179,6 +179,48 @@ struct AgentDetectionPublishUpdate {
     visible_blocker: bool,
     visible_working: bool,
     process_exited: bool,
+}
+
+/// Reserved metadata source for screen-derived presentation facts. Reports
+/// ride the existing agent-metadata channel, so background-activity labels
+/// stay visual-only and never author lifecycle state.
+const SCREEN_METADATA_SOURCE: &str = "herdr:screen";
+
+async fn publish_background_activity_change(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    agent: Option<Agent>,
+    change: crate::pane::agent_detection::BackgroundActivityChange,
+) {
+    let (custom_status, clear_custom_status) = match change {
+        crate::pane::agent_detection::BackgroundActivityChange::Set(label) => (Some(label), false),
+        crate::pane::agent_detection::BackgroundActivityChange::Clear => (None, true),
+    };
+    if let Err(e) = state_events
+        .send(AppEvent::HookMetadataReported {
+            pane_id,
+            source: SCREEN_METADATA_SOURCE.to_string(),
+            agent_label: agent.map(|agent| crate::detect::agent_label(agent).to_string()),
+            applies_to_source: None,
+            title: None,
+            display_agent: None,
+            custom_status,
+            state_labels: std::collections::HashMap::new(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_custom_status,
+            clear_state_labels: false,
+            seq: None,
+            ttl: None,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver background activity metadata event"
+        );
+    }
 }
 
 async fn apply_agent_detection_publish_update(
@@ -570,6 +612,7 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let mut background_activity = BackgroundActivityTracker::default();
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -784,7 +827,7 @@ fn spawn_basic_detection_task(
 
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
-            let Some(screen_detection) = detection_update_for_publish_with_osc(
+            let Some(screen_evaluation) = screen_detection_update_for_publish_with_osc(
                 agent,
                 &content,
                 &osc_title,
@@ -794,6 +837,12 @@ fn spawn_basic_detection_task(
                 pending_idle.clear();
                 continue;
             };
+            let screen_detection = screen_evaluation.detection;
+            if let Some(change) =
+                background_activity.observe(screen_evaluation.background_activity.as_deref())
+            {
+                publish_background_activity_change(&state_events, pane_id, agent, change).await;
+            }
             match decide_screen_detection_publish(
                 ScreenDetectionPublishInput {
                     screen_detection,
@@ -1959,6 +2008,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                let mut background_activity = BackgroundActivityTracker::default();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2220,7 +2270,7 @@ impl PaneRuntime {
 
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
-                    let Some(screen_detection) = detection_update_for_publish_with_osc(
+                    let Some(screen_evaluation) = screen_detection_update_for_publish_with_osc(
                         agent,
                         &content,
                         &osc_title,
@@ -2230,6 +2280,13 @@ impl PaneRuntime {
                         pending_idle.clear();
                         continue;
                     };
+                    let screen_detection = screen_evaluation.detection;
+                    if let Some(change) = background_activity
+                        .observe(screen_evaluation.background_activity.as_deref())
+                    {
+                        publish_background_activity_change(&state_events, pane_id, agent, change)
+                            .await;
+                    }
                     match decide_screen_detection_publish(
                         ScreenDetectionPublishInput {
                             screen_detection,

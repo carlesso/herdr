@@ -712,3 +712,343 @@ fn codex_osc_working_beats_weak_blocker_screen() {
         Some("osc_title_working")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Annotation rules — background activity labels that ride alongside state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn annotation_rule_parses_and_reports_background_activity_without_touching_state() {
+    with_manifest_dirs("annotation-basic", || {
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "prompt_idle"
+state = "idle"
+priority = 50
+contains = ["prompt ready"]
+
+[[rules]]
+id = "watchers"
+annotation = "background_activity"
+priority = 10
+contains = ["watching"]
+label_regex = '(watching(?: · \d+ \w+)+)'
+"#,
+        ));
+
+        let screen = "◉ watching · 2 monitors · 1 loop\nprompt ready\n";
+        let result = detect_with_annotations(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(result.detection.state, AgentState::Idle);
+        assert_eq!(
+            result.background_activity.as_deref(),
+            Some("watching · 2 monitors · 1 loop")
+        );
+
+        let explain = explain(Agent::Codex, screen);
+        assert_eq!(
+            explain.background_activity.as_deref(),
+            Some("watching · 2 monitors · 1 loop")
+        );
+        assert_eq!(
+            explain.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("prompt_idle"),
+            "annotation rules must not win state selection"
+        );
+        let annotation_rule = explain
+            .evaluated_rules
+            .iter()
+            .find(|rule| rule.id == "watchers")
+            .expect("annotation rule evaluated");
+        assert_eq!(
+            annotation_rule.annotation.as_deref(),
+            Some("background_activity")
+        );
+        assert!(annotation_rule.matched);
+
+        let without_chip = detect_with_annotations(
+            Agent::Codex,
+            DetectionInput {
+                screen: "prompt ready\n",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(without_chip.detection.state, AgentState::Idle);
+        assert_eq!(without_chip.background_activity, None);
+    });
+}
+
+#[test]
+fn annotation_label_falls_back_to_static_label_and_is_bounded() {
+    with_manifest_dirs("annotation-label", || {
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "static_label"
+annotation = "background_activity"
+priority = 10
+contains = ["background job running"]
+label = "background job"
+"#,
+        ));
+
+        let result = detect_with_annotations(
+            Agent::Codex,
+            DetectionInput {
+                screen: "background job running\n",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(
+            result.background_activity.as_deref(),
+            Some("background job")
+        );
+    });
+
+    let long_label = "x".repeat(200);
+    assert_eq!(bounded_annotation_label(&long_label).chars().count(), 81);
+}
+
+#[test]
+fn annotation_rules_prefer_higher_priority_and_survive_state_fallback() {
+    with_manifest_dirs("annotation-priority", || {
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "never_state"
+state = "working"
+priority = 50
+contains = ["no such text"]
+
+[[rules]]
+id = "low"
+annotation = "background_activity"
+priority = 1
+contains = ["watching"]
+label = "low"
+
+[[rules]]
+id = "high"
+annotation = "background_activity"
+priority = 9
+contains = ["watching"]
+label = "high"
+"#,
+        ));
+
+        // No state rule matches -> idle fallback, but the annotation still applies.
+        let result = detect_with_annotations(
+            Agent::Codex,
+            DetectionInput {
+                screen: "watching\n",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(result.detection.state, AgentState::Idle);
+        assert_eq!(result.background_activity.as_deref(), Some("high"));
+    });
+}
+
+#[test]
+fn annotation_rule_validation_rejects_bad_combinations() {
+    // annotation + state
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+annotation = "background_activity"
+state = "idle"
+contains = ["x"]
+label = "x"
+"#,
+    ))
+    .is_err());
+
+    // annotation without label or label_regex
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+annotation = "background_activity"
+contains = ["x"]
+"#,
+    ))
+    .is_err());
+
+    // label without annotation
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+state = "idle"
+contains = ["x"]
+label = "x"
+"#,
+    ))
+    .is_err());
+
+    // unknown annotation name
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+annotation = "sparkles"
+contains = ["x"]
+label = "x"
+"#,
+    ))
+    .is_err());
+
+    // invalid label_regex
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+annotation = "background_activity"
+contains = ["x"]
+label_regex = "(unclosed"
+"#,
+    ))
+    .is_err());
+
+    // annotation + visible flag
+    assert!(parse_manifest(&rules_manifest(
+        r#"
+[[rules]]
+id = "bad"
+annotation = "background_activity"
+visible_idle = true
+contains = ["x"]
+label = "x"
+"#,
+    ))
+    .is_err());
+}
+
+#[test]
+fn remote_manifest_requiring_newer_engine_is_rejected() {
+    let manifest = r#"
+id = "codex"
+version = "2026.07.07.1"
+min_engine_version = 99
+updated_at = "2026-07-07T00:00:00Z"
+
+[[rules]]
+id = "test"
+state = "idle"
+contains = ["ready"]
+"#;
+    let err = parse_remote_manifest_for_agent(Agent::Codex, manifest).unwrap_err();
+    assert!(
+        err.contains("requires engine 99"),
+        "unexpected error: {err}"
+    );
+}
+
+// --- Grok watching chip (evidence: Grok Build 0.2.x live pane read + pager
+// source watching_label(): fixed kind order, singular/plural nouns, pulse
+// glyph frames ○ ◎ ◉ ◎ / legacy · ○ • ○) ---
+
+#[test]
+fn grok_watching_chip_reports_background_activity_at_idle() {
+    for glyph in ["○", "◎", "◉", "·", "•"] {
+        for label in [
+            "watching · 1 loop",
+            "watching · 2 monitors · 1 loop",
+            "watching · 1 monitor · 2 loops · 1 subagent",
+            "watching · 3 subagents",
+        ] {
+            let screen =
+                format!("scrollback text\n\n{glyph} {label}\n╭──────╮\n│ >    │\n╰──────╯\n  Ctrl+.:shortcuts\n");
+            let result = detect_with_annotations(
+                Agent::Grok,
+                DetectionInput {
+                    screen: &screen,
+                    osc_title: "",
+                    osc_progress: "",
+                },
+            );
+            assert_eq!(
+                result.detection.state,
+                AgentState::Idle,
+                "state for glyph {glyph} label {label}"
+            );
+            assert_eq!(
+                result.background_activity.as_deref(),
+                Some(label),
+                "label for glyph {glyph}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grok_without_watching_chip_reports_no_background_activity() {
+    let idle_screen = "scrollback\n╭──────╮\n│ >    │\n╰──────╯\n  Ctrl+.:shortcuts\n";
+    let result = detect_with_annotations(
+        Agent::Grok,
+        DetectionInput {
+            screen: idle_screen,
+            osc_title: "",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(result.detection.state, AgentState::Idle);
+    assert_eq!(result.background_activity, None);
+
+    // Splash logos and scrollback prose mentioning "watching" must not match.
+    let prose = "we are watching the build\n╭──────╮\n│ >    │\n╰──────╯\n  Ctrl+.:shortcuts\n";
+    let result = detect_with_annotations(
+        Agent::Grok,
+        DetectionInput {
+            screen: prose,
+            osc_title: "",
+            osc_progress: "",
+        },
+    );
+    assert_eq!(result.background_activity, None);
+}
+
+#[test]
+fn prompt_box_regions_support_rounded_and_plain_borders() {
+    // Grok-style rounded box with a labeled bottom border and a footer below.
+    let grok_screen = "transcript prose\n\n    ○ watching · 1 monitor · 1 loop\n\n  ╭──────────────╮\n  │ ❯            │\n  ╰──── model ───╯\n\n  Shift+Tab:mode  │  Ctrl+.:shortcuts\n";
+    let input = DetectionInput {
+        screen: grok_screen,
+        osc_title: "",
+        osc_progress: "",
+    };
+    assert_eq!(
+        region(input, "last_non_empty_above_prompt_box"),
+        "    ○ watching · 1 monitor · 1 loop"
+    );
+    assert!(region(input, "above_prompt_box").contains("transcript prose"));
+    assert!(!region(input, "above_prompt_box").contains("Shift+Tab"));
+    assert_eq!(region(input, "prompt_box_body").trim(), "│ ❯            │");
+
+    // Claude-style plain-rule box keeps its existing semantics.
+    let claude_screen = "history\nchip line\n──────────\n> type here\n──────────\nfooter\n";
+    let claude_input = DetectionInput {
+        screen: claude_screen,
+        osc_title: "",
+        osc_progress: "",
+    };
+    assert_eq!(
+        region(claude_input, "last_non_empty_above_prompt_box"),
+        "chip line"
+    );
+    assert_eq!(
+        region(claude_input, "prompt_box_body").trim(),
+        "> type here"
+    );
+}

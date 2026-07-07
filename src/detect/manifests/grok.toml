@@ -1,7 +1,7 @@
 id = "grok"
-version = "2026.07.03.1"
-min_engine_version = 2
-updated_at = "2026-07-03T00:00:00Z"
+version = "2026.07.07.1"
+min_engine_version = 3
+updated_at = "2026-07-07T00:00:00Z"
 aliases = ["grok-build"]
 
 # Evidence: Grok Build 0.2.82 live pane reads.
@@ -96,3 +96,22 @@ not = [
   { contains = ["esc:cancel"] },
   { contains = ["ctrl+c:cancel"] },
 ]
+
+# Idle watcher cue, live-captured 2026-07-07 from Grok Build 0.2.x:
+#   "    ○ watching · 1 monitor · 1 loop"
+# rendered as the last non-empty line directly above the prompt box while
+# monitors, scheduled /loop tasks, or background subagents are alive at idle.
+# The leading glyph breathes through ○ ◎ ◉ ◎ (legacy console: · ○ • ○), so
+# every frame is accepted. The label lists only non-zero kinds in the fixed
+# order monitors, loops, subagents with singular/plural nouns. The region is
+# pinned to the single chip line because transcript prose can quote the label
+# text (task titles, agent replies); scrollback must never match. The captured
+# label (without the pulse glyph) is reported as the pane's background
+# activity; it never affects lifecycle state.
+[[rules]]
+id = "watching_background_activity"
+annotation = "background_activity"
+priority = 100
+region = "last_non_empty_above_prompt_box"
+line_regex = ['^\s*[○◎◉·•]\s+watching(?: · \d+ (?:monitors?|loops?|subagents?))+\s*$']
+label_regex = '(watching(?: · \d+ (?:monitors?|loops?|subagents?))+)'

@@ -19,6 +19,16 @@ pub enum AgentState {
     Unknown,
 }
 
+/// Full screen evaluation result: the lifecycle-state detection plus
+/// screen-derived annotations that ride alongside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenDetection {
+    pub detection: AgentDetection,
+    /// Display label from a matched `background_activity` annotation rule,
+    /// e.g. `watching · 1 loop` for agents that show background-task chrome.
+    pub background_activity: Option<String>,
+}
+
 /// Screen-derived agent state plus confidence metadata used for source arbitration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentDetection {
@@ -228,6 +238,35 @@ pub fn detect_agent_with_osc(
         };
     };
     manifest::detect_with_osc(
+        agent,
+        manifest::DetectionInput {
+            screen: screen_content,
+            osc_title,
+            osc_progress,
+        },
+    )
+}
+
+/// Detect state and screen annotations in one manifest pass.
+pub fn detect_screen_with_osc(
+    agent: Option<Agent>,
+    screen_content: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> ScreenDetection {
+    let Some(agent) = agent else {
+        return ScreenDetection {
+            detection: AgentDetection {
+                state: AgentState::Unknown,
+                skip_state_update: false,
+                visible_idle: false,
+                visible_blocker: false,
+                visible_working: false,
+            },
+            background_activity: None,
+        };
+    };
+    manifest::detect_with_annotations(
         agent,
         manifest::DetectionInput {
             screen: screen_content,

@@ -302,18 +302,76 @@ pub(super) fn detection_update_for_publish_with_osc(
     osc_progress: &str,
     process_exited: bool,
 ) -> Option<crate::detect::AgentDetection> {
+    screen_detection_update_for_publish_with_osc(
+        agent,
+        content,
+        osc_title,
+        osc_progress,
+        process_exited,
+    )
+    .map(|screen| screen.detection)
+}
+
+pub(super) fn screen_detection_update_for_publish_with_osc(
+    agent: Option<Agent>,
+    content: &str,
+    osc_title: &str,
+    osc_progress: &str,
+    process_exited: bool,
+) -> Option<crate::detect::ScreenDetection> {
     if process_exited {
-        return Some(crate::detect::AgentDetection {
-            state: AgentState::Idle,
-            skip_state_update: false,
-            visible_idle: true,
-            visible_blocker: false,
-            visible_working: false,
+        return Some(crate::detect::ScreenDetection {
+            detection: crate::detect::AgentDetection {
+                state: AgentState::Idle,
+                skip_state_update: false,
+                visible_idle: true,
+                visible_blocker: false,
+                visible_working: false,
+            },
+            // The foreground agent is gone; any screen-derived background
+            // activity chrome no longer describes a live process.
+            background_activity: None,
         });
     }
 
-    let detection = crate::detect::detect_agent_with_osc(agent, content, osc_title, osc_progress);
-    (!detection.skip_state_update).then_some(detection)
+    let screen = crate::detect::detect_screen_with_osc(agent, content, osc_title, osc_progress);
+    (!screen.detection.skip_state_update).then_some(screen)
+}
+
+/// Tracks the last published screen-derived background-activity label and
+/// decides when a change needs reporting. Pure state machine so pane loops
+/// stay thin and the semantics are unit-testable without PTYs.
+#[derive(Debug, Default)]
+pub(super) struct BackgroundActivityTracker {
+    last_reported: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BackgroundActivityChange {
+    /// Publish this label (new or changed).
+    Set(String),
+    /// Clear the previously published label.
+    Clear,
+}
+
+impl BackgroundActivityTracker {
+    /// Observe the label from the latest screen evaluation. Returns the
+    /// change to publish, or `None` when the published value is already
+    /// current.
+    pub(super) fn observe(&mut self, label: Option<&str>) -> Option<BackgroundActivityChange> {
+        match (self.last_reported.as_deref(), label) {
+            (previous, current) if previous == current => None,
+            (_, Some(current)) => {
+                self.last_reported = Some(current.to_string());
+                Some(BackgroundActivityChange::Set(current.to_string()))
+            }
+            (Some(_), None) => {
+                self.last_reported = None;
+                Some(BackgroundActivityChange::Clear)
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
@@ -552,5 +610,38 @@ mod tests {
         mark_detection_content_changed(&seq);
 
         assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn background_activity_tracker_reports_only_changes() {
+        let mut tracker = BackgroundActivityTracker::default();
+
+        assert_eq!(tracker.observe(None), None);
+        assert_eq!(
+            tracker.observe(Some("watching · 1 loop")),
+            Some(BackgroundActivityChange::Set("watching · 1 loop".into()))
+        );
+        assert_eq!(tracker.observe(Some("watching · 1 loop")), None);
+        assert_eq!(
+            tracker.observe(Some("watching · 2 loops")),
+            Some(BackgroundActivityChange::Set("watching · 2 loops".into()))
+        );
+        assert_eq!(tracker.observe(None), Some(BackgroundActivityChange::Clear));
+        assert_eq!(tracker.observe(None), None);
+    }
+
+    #[test]
+    fn process_exit_screen_detection_clears_background_activity() {
+        let screen = screen_detection_update_for_publish_with_osc(
+            Some(Agent::Grok),
+            "◉ watching · 1 loop\n",
+            "",
+            "",
+            true,
+        )
+        .expect("process exit always publishes");
+
+        assert_eq!(screen.detection.state, AgentState::Idle);
+        assert_eq!(screen.background_activity, None);
     }
 }

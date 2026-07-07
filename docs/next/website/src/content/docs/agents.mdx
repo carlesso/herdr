@@ -125,6 +125,14 @@ herdr pane report-agent w1:p1 \
 
 `state` controls waits, notifications, and rollups. `custom-status` is only display text.
 
+## Background activity
+
+Some agents keep working in the background while their prompt is idle. When an agent shows visible background-task chrome, Herdr's screen detection can surface it as a visual-only label next to the pane state.
+
+Grok Build's idle watcher cue is detected out of the box: a pane with running monitors, scheduled `/loop` tasks, or background subagents shows its `watching · …` label (for example `idle · grok · watching · 1 monitor · 2 loops`) in the sidebar, navigator, and socket API pane presentation fields.
+
+Background activity labels never change the semantic state. Waits, notifications, and workspace rollups still see the pane as `idle`.
+
 ## Start agents from the CLI
 
 Use `herdr agent ...` commands when you want a terminal to be treated as an agent target. Agent targets show up in `agent list`, can be read or sent input by agent name, can be waited on by agent state, and can be directly attached.

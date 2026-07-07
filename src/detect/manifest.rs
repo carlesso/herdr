@@ -37,6 +37,9 @@ pub struct DetectionExplain {
     pub skip_state_update: bool,
     pub skipped_update_reason: Option<String>,
     pub fallback_reason: Option<String>,
+    /// Screen-derived background-activity label from the highest-priority
+    /// matching annotation rule, e.g. `watching · 1 loop`.
+    pub background_activity: Option<String>,
     pub evaluated_rules: Vec<EvaluatedRule>,
     pub warning: Option<String>,
     pub manifest_version: Option<String>,
@@ -105,6 +108,9 @@ pub struct EvaluatedRule {
     pub region: String,
     pub evidence: RuleEvidence,
     pub state: AgentState,
+    /// Annotation name for annotation rules (e.g. `background_activity`);
+    /// `None` for state rules.
+    pub annotation: Option<String>,
     pub matched: bool,
 }
 
@@ -154,6 +160,17 @@ pub(crate) struct AgentManifest {
 struct ManifestRule {
     id: String,
     state: Option<ManifestState>,
+    /// Annotation rules attach screen-derived presentation facts instead of a
+    /// lifecycle state. The only supported annotation is
+    /// `"background_activity"`: visible chrome showing that background work
+    /// (watchers, loops, monitors) is attached to an otherwise idle agent.
+    annotation: Option<ManifestAnnotation>,
+    /// Static display label reported when an annotation rule matches and no
+    /// `label_regex` capture applies.
+    label: Option<String>,
+    /// Regex applied to the rule region when the rule matches; capture group 1
+    /// (or the whole match) becomes the reported annotation label.
+    label_regex: Option<String>,
     #[serde(default)]
     priority: i32,
     #[serde(default = "default_region")]
@@ -180,6 +197,20 @@ struct ManifestRule {
     line_regex: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManifestAnnotation {
+    BackgroundActivity,
+}
+
+impl ManifestAnnotation {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BackgroundActivity => "background_activity",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct ManifestGate {
@@ -200,6 +231,7 @@ struct ManifestGate {
 #[derive(Debug, Clone)]
 struct CompiledRule {
     gate: CompiledGate,
+    label_regex: Option<Regex>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +369,23 @@ pub fn detect_with_osc(agent: Agent, input: DetectionInput<'_>) -> AgentDetectio
     evaluate_loaded_manifest(agent, input, loaded, false).into_detection()
 }
 
+/// Combined screen evaluation: lifecycle-state detection plus the
+/// screen-derived background-activity label from annotation rules, computed
+/// in a single manifest pass.
+pub fn detect_with_annotations(agent: Agent, input: DetectionInput<'_>) -> super::ScreenDetection {
+    let Some(loaded) = load_manifest(agent) else {
+        return super::ScreenDetection {
+            detection: fallback_explain(Some(agent), None, false).into_detection(),
+            background_activity: None,
+        };
+    };
+    let explain = evaluate_loaded_manifest(agent, input, loaded, false);
+    super::ScreenDetection {
+        background_activity: explain.background_activity.clone(),
+        detection: explain.into_detection(),
+    }
+}
+
 pub fn explain(agent: Agent, screen_content: &str) -> DetectionExplain {
     explain_with_input(
         agent,
@@ -369,6 +418,7 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
             skip_state_update: false,
             skipped_update_reason: None,
             fallback_reason: Some("unknown_agent".to_string()),
+            background_activity: None,
             evaluated_rules: Vec::new(),
             warning: None,
             manifest_version: None,
@@ -417,6 +467,7 @@ fn evaluate_loaded_manifest(
     include_update_status: bool,
 ) -> DetectionExplain {
     let mut matched: Option<(&ManifestRule, String)> = None;
+    let mut matched_annotation: Option<(&ManifestRule, String)> = None;
     let mut evaluated_rules = Vec::new();
 
     for (rule, compiled_rule) in loaded.manifest.rules.iter().zip(&loaded.compiled_rules) {
@@ -431,10 +482,24 @@ fn evaluate_loaded_manifest(
                 .state
                 .map(AgentState::from)
                 .unwrap_or(AgentState::Unknown),
+            annotation: rule.annotation.map(|annotation| annotation.label().into()),
             matched: matched_rule,
         });
 
         if !matched_rule {
+            continue;
+        }
+
+        // Annotation rules never participate in state selection; they attach
+        // a presentation label alongside whatever state the state rules pick.
+        if rule.annotation.is_some() {
+            let Some(label) = annotation_label(rule, compiled_rule, region_text) else {
+                continue;
+            };
+            match matched_annotation {
+                Some((previous, _)) if previous.priority >= rule.priority => {}
+                _ => matched_annotation = Some((rule, label)),
+            }
             continue;
         }
 
@@ -444,12 +509,18 @@ fn evaluate_loaded_manifest(
         }
     }
 
+    let background_activity = matched_annotation
+        .filter(|(rule, _)| rule.annotation == Some(ManifestAnnotation::BackgroundActivity))
+        .map(|(_, label)| label);
+
     let Some((rule, region_name)) = matched else {
-        return fallback_explain(
+        let mut explain = fallback_explain(
             Some(agent),
             Some((loaded, evaluated_rules)),
             include_update_status,
         );
+        explain.background_activity = background_activity;
+        return explain;
     };
 
     let state = rule
@@ -481,6 +552,7 @@ fn evaluate_loaded_manifest(
         skip_state_update: rule.skip_state_update,
         skipped_update_reason,
         fallback_reason: None,
+        background_activity,
         evaluated_rules,
         warning: loaded.warning,
         manifest_version: loaded.manifest.version.as_ref().map(ToString::to_string),
@@ -538,6 +610,7 @@ fn fallback_explain(
         skip_state_update: false,
         skipped_update_reason: None,
         fallback_reason: known_agent.then(|| DEFAULT_KNOWN_AGENT_IDLE_FALLBACK.to_string()),
+        background_activity: None,
         evaluated_rules,
         warning,
         manifest_version,
@@ -813,6 +886,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
                 "priority": rule.priority,
                 "region": rule.region,
                 "state": agent_state_label(rule.state),
+                "annotation": rule.annotation,
                 "matched": rule.matched,
                 "evidence": {
                     "contains": &rule.evidence.contains,
@@ -838,6 +912,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
         "remote_update_status": &explain.remote_update_status,
         "remote_update_error": &explain.remote_update_error,
         "matched_rule": matched_rule,
+        "background_activity": explain.background_activity,
         "visible_idle": explain.visible_idle,
         "visible_blocker": explain.visible_blocker,
         "visible_working": explain.visible_working,
@@ -850,6 +925,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
     })
 }
 
+#[derive(Debug)]
 pub(crate) struct ParsedRemoteManifest {
     pub(crate) manifest: AgentManifest,
     pub(crate) version: ManifestVersion,
@@ -918,6 +994,37 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
                     rule.id
                 ));
             }
+        }
+        if rule.annotation.is_some() {
+            if rule.state.is_some()
+                || rule.visible_idle
+                || rule.visible_blocker
+                || rule.visible_working
+                || rule.skip_state_update
+            {
+                return Err(format!(
+                    "rule {} is an annotation rule and must not set state, visible flags, or skip_state_update",
+                    rule.id
+                ));
+            }
+            if rule.label.is_none() && rule.label_regex.is_none() {
+                return Err(format!(
+                    "rule {} is an annotation rule and needs label or label_regex",
+                    rule.id
+                ));
+            }
+        } else if rule.label.is_some() || rule.label_regex.is_some() {
+            return Err(format!(
+                "rule {} sets label or label_regex without annotation",
+                rule.id
+            ));
+        }
+        if let Some(pattern) = &rule.label_regex {
+            validate_regex_patterns(
+                std::slice::from_ref(pattern),
+                &format!("rule {}", rule.id),
+                "label_regex",
+            )?;
         }
         validate_region_name(&rule.region)
             .map_err(|err| format!("rule {} uses invalid region: {err}", rule.id))?;
@@ -1121,9 +1228,17 @@ fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Strin
         .rules
         .iter()
         .map(|rule| {
-            compile_gate(&manifest_gate_from_rule(rule))
-                .map(|gate| CompiledRule { gate })
-                .map_err(|err| format!("rule {} could not be compiled: {err}", rule.id))
+            let gate = compile_gate(&manifest_gate_from_rule(rule))
+                .map_err(|err| format!("rule {} could not be compiled: {err}", rule.id))?;
+            let label_regex = rule
+                .label_regex
+                .as_deref()
+                .map(|pattern| {
+                    Regex::new(pattern)
+                        .map_err(|err| format!("rule {} has invalid label_regex: {err}", rule.id))
+                })
+                .transpose()?;
+            Ok(CompiledRule { gate, label_regex })
         })
         .collect()
 }
@@ -1166,6 +1281,44 @@ fn compile_gate(gate: &ManifestGate) -> Result<CompiledGate, String> {
 fn compiled_rule_matches(rule: &CompiledRule, text: &str) -> bool {
     let lower_text = text.to_lowercase();
     compiled_gate_matches(&rule.gate, text, &lower_text)
+}
+
+/// Resolve the display label for a matched annotation rule: the first
+/// `label_regex` capture group (or whole match) from the rule region wins,
+/// otherwise the static `label`. Returns `None` when neither yields text,
+/// which drops the annotation for this evaluation.
+fn annotation_label(
+    rule: &ManifestRule,
+    compiled_rule: &CompiledRule,
+    region_text: &str,
+) -> Option<String> {
+    if let Some(label_regex) = &compiled_rule.label_regex {
+        if let Some(captures) = label_regex.captures(region_text) {
+            let extracted = captures
+                .get(1)
+                .or_else(|| captures.get(0))
+                .map(|group| group.as_str().trim())
+                .filter(|label| !label.is_empty());
+            if let Some(extracted) = extracted {
+                return Some(bounded_annotation_label(extracted));
+            }
+        }
+    }
+    rule.label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(bounded_annotation_label)
+}
+
+/// Keep reported annotation labels to a sane display length.
+fn bounded_annotation_label(label: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut bounded: String = label.chars().take(MAX_CHARS).collect();
+    if label.chars().count() > MAX_CHARS {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn rule_evidence(rule: &ManifestRule, region_text: &str) -> RuleEvidence {
@@ -1378,7 +1531,7 @@ fn prompt_box_body(content: &str) -> Option<&str> {
     let start = line_start_offset(content, &lines, top + 1);
     let end_index = lines[top + 1..]
         .iter()
-        .position(|line| is_horizontal_rule(line))
+        .position(|line| is_prompt_box_border_line(line))
         .map(|relative| top + 1 + relative)
         .unwrap_or(lines.len());
     let end = line_start_offset(content, &lines, end_index);
@@ -1418,7 +1571,7 @@ fn last_non_empty_line(content: &str) -> &str {
 fn prompt_box_top_border_index(lines: &[&str]) -> Option<usize> {
     let mut border_count = 0;
     for index in (0..lines.len()).rev() {
-        if is_horizontal_rule(lines[index]) {
+        if is_prompt_box_border_line(lines[index]) {
             border_count += 1;
             if border_count == 2 {
                 return Some(index);
@@ -1426,6 +1579,22 @@ fn prompt_box_top_border_index(lines: &[&str]) -> Option<usize> {
         }
     }
     None
+}
+
+/// True for lines that can form a prompt-box horizontal border: plain `─`
+/// rules (Claude-style boxes) or box-drawing borders that start with a
+/// rounded/square corner such as `╭────╮` / `╰──── label ─╯` (Grok-style
+/// boxes, which may carry trailing text inside the border line).
+fn is_prompt_box_border_line(line: &str) -> bool {
+    if is_horizontal_rule(line) {
+        return true;
+    }
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    if !matches!(chars.next(), Some('╭' | '╰' | '┌' | '└')) {
+        return false;
+    }
+    chars.take_while(|&ch| ch == '─').count() >= 3
 }
 
 fn is_horizontal_rule(line: &str) -> bool {
